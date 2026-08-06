@@ -9,7 +9,14 @@ from .allocate import (
 )
 from .cost import GPU_CATALOG, budget_from_gpus, cost_report, flops_to_wallclock
 from .fit import FitResult, compare_fit_strategies, fit_chinchilla, fit_shared_exponents
-from .io import load_runs, save_allocation_csv, save_markdown_report
+from .io import (
+    load_fit_json,
+    load_runs,
+    params_from_fit,
+    save_allocation_csv,
+    save_fit_json,
+    save_markdown_report,
+)
 from .laws import (
     OPTIMIZER_RHOS,
     ChinchillaParams,
@@ -39,8 +46,11 @@ __all__ = [
     "flops_to_wallclock",
     "isoflop_curve",
     "list_optimizers",
+    "load_fit_json",
     "load_runs",
+    "params_from_fit",
     "save_allocation_csv",
+    "save_fit_json",
     "save_markdown_report",
 ]
 

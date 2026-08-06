@@ -100,16 +100,13 @@ export function allocate(
   opt: OptimizerMeta,
   p: ChinchillaParams = DEFAULT_PARAMS,
 ): { N: number; D: number; loss: number; tokensPerParam: number } {
+  // Minimize L=E+A/(ρN N)^α+B/(ρD D)^β s.t. C=6ND
   const a = p.alpha;
   const b = p.beta;
   const gStar = ((p.A * a) / (p.B * b)) ** (1 / (a + b));
-  let nEff = gStar * (compute / 6) ** (b / (a + b));
-  let dEff = compute / 6 / nEff;
-  let n = nEff / opt.rho_n;
-  let d = dEff / opt.rho_d;
-  const scale = Math.sqrt(compute / (6 * n * d));
-  n *= scale;
-  d *= scale;
+  const rhoPref = (opt.rho_d ** b / opt.rho_n ** a) ** (1 / (a + b));
+  const n = gStar * rhoPref * (compute / 6) ** (b / (a + b));
+  const d = compute / (6 * n);
   return { N: n, D: d, loss: loss(n, d, opt, p), tokensPerParam: d / n };
 }
 

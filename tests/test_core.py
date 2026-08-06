@@ -48,14 +48,35 @@ def test_fixed_n():
 
 
 def test_isoflop_min_near_closed_form():
-    curve = isoflop_curve(1e21, "adamw", n_points=80)
-    assert abs(np.log(curve["N_star"]) - np.log(curve["closed_form"]["N"])) < 0.15
+    for opt in ("adamw", "muon"):
+        curve = isoflop_curve(1e21, opt, n_points=120)
+        assert abs(np.log(curve["N_star"]) - np.log(curve["closed_form"]["N"])) < 0.05
+
+
+def test_rho_closed_form_matches_grid_when_alpha_ne_beta():
+    """Correct ρ pref: (ρ_D^β / ρ_N^α)^{1/(α+β)}, not sqrt(ρ_D/ρ_N)."""
+    params = ChinchillaParams()  # α=0.34 ≠ β=0.28
+    compute = 1e24
+    closed = allocate_for_budget(compute, "muon", params=params)
+    n_grid = np.geomspace(closed["N"] / 5, closed["N"] * 5, 400)
+    d_grid = compute / (6.0 * n_grid)
+    rho = OptimizerRho.from_name("muon")
+    losses = np.asarray(chinchilla_loss(n_grid, d_grid, params, rho), dtype=float)
+    i = int(np.argmin(losses))
+    assert closed["N"] == pytest.approx(float(n_grid[i]), rel=1e-2)
+    assert closed["loss"] == pytest.approx(float(losses[i]), rel=1e-5)
 
 
 def test_target_loss_solver():
     base = allocate_for_budget(1e21, "adamw")
     solved = compute_for_target_loss(base["loss"], "adamw")
     assert solved["compute"] == pytest.approx(1e21, rel=0.05)
+    assert solved["solved"] is True
+
+
+def test_target_loss_rejects_below_E():
+    with pytest.raises(ValueError):
+        compute_for_target_loss(1.0, "adamw")  # E=1.69
 
 
 def test_cost_and_gpu_budget():

@@ -10,8 +10,16 @@ from typing import Any
 from .allocate import allocate_for_budget, compare_optimizers, isoflop_curve
 from .cost import budget_from_gpus, cost_report, list_gpus
 from .fit import compare_fit_strategies, simulate_isoflop_data
-from .io import export_python_snippet, load_runs, save_allocation_csv, save_markdown_report
-from .laws import list_optimizers
+from .io import (
+    export_python_snippet,
+    load_fit_json,
+    load_runs,
+    params_from_fit,
+    save_allocation_csv,
+    save_fit_json,
+    save_markdown_report,
+)
+from .laws import ChinchillaParams, list_optimizers
 
 
 def _print(data: Any) -> None:
@@ -30,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--optimizer", default="adamw")
     a.add_argument("--rho-n", type=float, default=None)
     a.add_argument("--rho-d", type=float, default=None)
+    a.add_argument("--fit", default=None, help="fit.json from `optiscale fit --out`")
 
     c = sub.add_parser("compare", help="Compare optimizers at a budget")
     c.add_argument("--flops", type=float, default=None)
@@ -40,11 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--mfu", type=float, default=None)
     c.add_argument("--csv", default=None)
     c.add_argument("--md", default=None)
+    c.add_argument("--fit", default=None, help="fit.json with fitted ρ overrides")
 
     f = sub.add_parser("fit", help="Fit laws from CSV/JSON or synthetic demo")
     f.add_argument("--data", default=None, help="Path to CSV/JSON runs")
     f.add_argument("--synthetic", action="store_true")
     f.add_argument("--noise", type=float, default=0.01)
+    f.add_argument("--out", default=None, help="Write fit.json for allocate --fit")
 
     r = sub.add_parser("report", help="Full cost + savings report")
     r.add_argument("--flops", type=float, default=None)
@@ -77,17 +88,31 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "allocate":
+        params = None
+        rho_n, rho_d = args.rho_n, args.rho_d
+        if args.fit:
+            fit = load_fit_json(args.fit)
+            params, rhos = params_from_fit(fit)
+            if args.optimizer in rhos and rho_n is None and rho_d is None:
+                rho_n = rhos[args.optimizer].rho_n
+                rho_d = rhos[args.optimizer].rho_d
         _print(
             allocate_for_budget(
                 args.flops,
                 optimizer=args.optimizer,
-                rho_n=args.rho_n,
-                rho_d=args.rho_d,
+                params=params,
+                rho_n=rho_n,
+                rho_d=rho_d,
             )
         )
     elif args.cmd == "compare":
         opts = [x.strip() for x in args.optimizers.split(",") if x.strip()]
         compute = args.flops
+        fit_params = None
+        fit_rhos = None
+        if getattr(args, "fit", None):
+            fit = load_fit_json(args.fit)
+            fit_params, fit_rhos = params_from_fit(fit)
         if compute is None:
             if args.budget_usd is None:
                 print("Provide --flops or --budget-usd", file=sys.stderr)
@@ -102,7 +127,18 @@ def main(argv: list[str] | None = None) -> int:
             compute = report["wallclock"]["compute"]
             rows = report["allocations"]
         else:
-            rows = compare_optimizers(compute, optimizers=opts)
+            rows = []
+            for name in opts:
+                kw = {"params": fit_params} if fit_params else {}
+                if fit_rhos and name in fit_rhos:
+                    kw["rho_n"] = fit_rhos[name].rho_n
+                    kw["rho_d"] = fit_rhos[name].rho_d
+                rows.append(allocate_for_budget(compute, optimizer=name, **kw))
+            # ratios vs adamw
+            base = next((r for r in rows if r["optimizer"] == "adamw"), rows[0])
+            for row in rows:
+                row["N_ratio_vs_ref"] = row["N"] / base["N"]
+                row["delta_N_vs_ref"] = row["N"] - base["N"]
         if args.csv:
             save_allocation_csv(rows, args.csv)
         if args.md:
@@ -125,7 +161,11 @@ def main(argv: list[str] | None = None) -> int:
             }
         else:
             runs = load_runs(args.data)
-        _print(compare_fit_strategies(runs))
+        result = compare_fit_strategies(runs)
+        if args.out:
+            save_fit_json(result, args.out)
+            result = {**result, "wrote": args.out}
+        _print(result)
     elif args.cmd == "report":
         report = cost_report(
             compute=args.flops,

@@ -31,7 +31,7 @@ optiscale = "optiscale.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Sqlace/optiscale"
-Documentation = "https://spectral-training.github.io/optiscale/"
+Documentation = "https://github.com/Sqlace/optiscale"
 
 [tool.setuptools.packages.find]
 where = ["src"]

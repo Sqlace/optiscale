@@ -123,6 +123,12 @@ def save_markdown_report(report: dict[str, Any], path: str | Path) -> None:
             f"{row.get('N_ratio_vs_ref', 1):.3f} |"
         )
     lines.extend(["", "## Savings to match AdamW loss", ""])
+    disclaimer = report.get(
+        "rho_disclaimer",
+        "ρ are planning priors unless --fit was used.",
+    )
+    lines.append(f"_{disclaimer}_")
+    lines.append("")
     for s in report.get("savings_vs_adamw_loss", []):
         lines.append(
             f"- **{s['label']}**: {s['pct_compute_saved']:.1f}% less compute "

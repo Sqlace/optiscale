@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .allocate import allocate_for_budget, compare_optimizers, compute_for_target_loss
-from .laws import format_flops, format_params
+from .laws import ChinchillaParams, OptimizerRho, format_flops, format_params
+
+PLANNING_PRIOR_DISCLAIMER = (
+    "ρ are planning priors unless --fit (or params/rho_overrides) was provided."
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,21 @@ def budget_from_gpus(
     }
 
 
+def _rho_kw(
+    name: str,
+    rho_overrides: dict[str, OptimizerRho | dict[str, Any]] | None,
+) -> dict[str, float]:
+    if not rho_overrides or name not in rho_overrides:
+        return {}
+    meta = rho_overrides[name]
+    if isinstance(meta, OptimizerRho):
+        return {"rho_n": meta.rho_n, "rho_d": meta.rho_d}
+    return {
+        "rho_n": float(meta.get("rho_n", 1.0)),
+        "rho_d": float(meta.get("rho_d", 1.0)),
+    }
+
+
 def cost_report(
     compute: float | None = None,
     budget_usd: float | None = None,
@@ -113,8 +132,14 @@ def cost_report(
     count: int = 8,
     mfu: float | None = None,
     optimizers: list[str] | None = None,
+    params: ChinchillaParams | None = None,
+    rho_overrides: dict[str, OptimizerRho | dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Full cost + multi-optimizer allocation report."""
+    """Full cost + multi-optimizer allocation report.
+
+    Pass fitted ``params`` / ``rho_overrides`` (e.g. from ``params_from_fit``)
+    so allocations honor fitted ρ instead of planning priors.
+    """
     gpu = get_gpu(gpu_id)
     mfu = gpu.default_mfu if mfu is None else mfu
     if compute is None:
@@ -123,16 +148,29 @@ def cost_report(
         hours = budget_usd / (gpu.dollars_per_hour * count)
         compute = budget_from_gpus(gpu_id, count, hours, mfu)["compute"]
     wall = flops_to_wallclock(compute, gpu_id, count, mfu)
-    rows = compare_optimizers(compute, optimizers=optimizers)
+    rows = compare_optimizers(
+        compute,
+        optimizers=optimizers,
+        params=params,
+        rho_overrides=rho_overrides,
+    )
     for row in rows:
         row["N_human"] = format_params(row["N"])
         row["D_human"] = format_params(row["D"])
-    adamw = allocate_for_budget(compute, "adamw")
+    adamw = allocate_for_budget(
+        compute, "adamw", params=params, **_rho_kw("adamw", rho_overrides)
+    )
+    fitted = bool(params is not None or rho_overrides)
     savings = []
     for row in rows:
         if row["optimizer"] == "adamw":
             continue
-        match = compute_for_target_loss(adamw["loss"], optimizer=row["optimizer"])
+        match = compute_for_target_loss(
+            adamw["loss"],
+            optimizer=row["optimizer"],
+            params=params,
+            **_rho_kw(row["optimizer"], rho_overrides),
+        )
         match_wall = flops_to_wallclock(match["compute"], gpu_id, count, mfu)
         savings.append(
             {
@@ -151,4 +189,10 @@ def cost_report(
         "allocations": rows,
         "savings_vs_adamw_loss": savings,
         "reference_adamw_loss": adamw["loss"],
+        "used_fitted_rhos": fitted,
+        "rho_disclaimer": (
+            "ρ from fit.json / overrides."
+            if fitted
+            else PLANNING_PRIOR_DISCLAIMER
+        ),
     }

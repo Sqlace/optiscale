@@ -169,6 +169,8 @@ def fit_shared_exponents(
     runs: dict[str, dict[str, np.ndarray]],
     reference: str = "adamw",
     huber_delta: float = 0.01,
+    bootstrap: int = 0,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """Fit shared α,β with per-optimizer ρ_N, ρ_D (AdamW fixed at 1).
 
@@ -231,7 +233,7 @@ def fit_shared_exponents(
         pred = np.asarray(chinchilla_loss(data["N"], data["D"], params, rhos[name]), dtype=float)
         per_opt_rmse[name] = float(np.sqrt(np.mean((pred - data["L"]) ** 2)))
 
-    return {
+    out: dict[str, Any] = {
         "params": params.as_dict(),
         "rhos": {k: v.as_dict() for k, v in rhos.items()},
         "per_optimizer_rmse": per_opt_rmse,
@@ -240,16 +242,65 @@ def fit_shared_exponents(
         "method": "shared_exponents",
     }
 
+    n_total = sum(len(data["L"]) for data in runs.values())
+    if bootstrap > 0 and n_total >= 8:
+        rng = np.random.default_rng(seed)
+        param_samples: list[dict[str, float]] = []
+        rho_samples: dict[str, list[tuple[float, float]]] = {k: [] for k in rhos}
+        for _ in range(bootstrap):
+            boot_runs: dict[str, dict[str, np.ndarray]] = {}
+            for name, data in runs.items():
+                n_pts = len(data["L"])
+                idx = rng.integers(0, n_pts, size=n_pts)
+                boot_runs[name] = {
+                    "N": np.asarray(data["N"], dtype=float)[idx],
+                    "D": np.asarray(data["D"], dtype=float)[idx],
+                    "L": np.asarray(data["L"], dtype=float)[idx],
+                }
+            sub = fit_shared_exponents(
+                boot_runs, reference=reference, huber_delta=huber_delta, bootstrap=0
+            )
+            param_samples.append(sub["params"])
+            for name, meta in sub["rhos"].items():
+                rho_samples[name].append((meta["rho_n"], meta["rho_d"]))
+        ci: dict[str, Any] = {}
+        for key in ["E", "A", "B", "alpha", "beta"]:
+            vals = np.array([s[key] for s in param_samples])
+            ci[key] = (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5)))
+        rho_ci = {}
+        for name, pairs in rho_samples.items():
+            rn = np.array([p[0] for p in pairs])
+            rd = np.array([p[1] for p in pairs])
+            rho_ci[name] = {
+                "rho_n": (float(np.percentile(rn, 2.5)), float(np.percentile(rn, 97.5))),
+                "rho_d": (float(np.percentile(rd, 2.5)), float(np.percentile(rd, 97.5))),
+            }
+        out["ci"] = ci
+        out["rho_ci"] = rho_ci
+
+    return out
+
 
 def compare_fit_strategies(
     runs: dict[str, dict[str, np.ndarray]],
     reference: str = "adamw",
+    bootstrap: int = 0,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """Side-by-side: separate per-optimizer fits vs shared-exponent robust fit."""
     separate = {}
     for name, data in runs.items():
-        separate[name] = fit_chinchilla(data["N"], data["D"], data["L"], optimizer=name).as_dict()
-    shared = fit_shared_exponents(runs, reference=reference)
+        separate[name] = fit_chinchilla(
+            data["N"],
+            data["D"],
+            data["L"],
+            optimizer=name,
+            bootstrap=bootstrap,
+            seed=seed,
+        ).as_dict()
+    shared = fit_shared_exponents(
+        runs, reference=reference, bootstrap=bootstrap, seed=seed
+    )
     # Parameter variance across separate fits (ill-conditioning signal)
     alphas = [separate[k]["params"]["alpha"] for k in separate]
     betas = [separate[k]["params"]["beta"] for k in separate]

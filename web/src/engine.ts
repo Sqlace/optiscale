@@ -39,14 +39,19 @@ export type GPUSpec = {
   peakTflops: number;
   usdPerHour: number;
   defaultMfu: number;
+  memoryGb: number;
 };
 
+/** Mirrors Python `cost.GPU_CATALOG`. */
 export const GPUS: GPUSpec[] = [
-  { id: "h100", name: "H100 SXM", peakTflops: 989, usdPerHour: 4.0, defaultMfu: 0.4 },
-  { id: "a100", name: "A100 80GB", peakTflops: 312, usdPerHour: 2.2, defaultMfu: 0.45 },
-  { id: "l40s", name: "L40S", peakTflops: 362, usdPerHour: 1.6, defaultMfu: 0.35 },
-  { id: "rtx4090", name: "RTX 4090", peakTflops: 330, usdPerHour: 0.8, defaultMfu: 0.3 },
-  { id: "v100", name: "V100", peakTflops: 125, usdPerHour: 0.9, defaultMfu: 0.4 },
+  { id: "h100", name: "H100 SXM", peakTflops: 989, usdPerHour: 4.0, defaultMfu: 0.4, memoryGb: 80 },
+  { id: "h100_pcie", name: "H100 PCIe", peakTflops: 756, usdPerHour: 3.5, defaultMfu: 0.38, memoryGb: 80 },
+  { id: "a100", name: "A100 80GB", peakTflops: 312, usdPerHour: 2.2, defaultMfu: 0.45, memoryGb: 80 },
+  { id: "a100_40", name: "A100 40GB", peakTflops: 312, usdPerHour: 1.8, defaultMfu: 0.42, memoryGb: 40 },
+  { id: "l40s", name: "L40S", peakTflops: 362, usdPerHour: 1.6, defaultMfu: 0.35, memoryGb: 48 },
+  { id: "rtx4090", name: "RTX 4090", peakTflops: 330, usdPerHour: 0.8, defaultMfu: 0.3, memoryGb: 24 },
+  { id: "v100", name: "V100", peakTflops: 125, usdPerHour: 0.9, defaultMfu: 0.4, memoryGb: 32 },
+  { id: "tpu_v5e", name: "TPU v5e", peakTflops: 197, usdPerHour: 1.2, defaultMfu: 0.5, memoryGb: 16 },
 ];
 
 export const PRESETS = [
@@ -67,6 +72,14 @@ export function getGpu(id: string): GPUSpec {
   const g = GPUS.find((x) => x.id === id);
   if (!g) throw new Error(`Unknown GPU ${id}`);
   return g;
+}
+
+export function withRho(opt: OptimizerMeta, rho_n?: number, rho_d?: number): OptimizerMeta {
+  return {
+    ...opt,
+    rho_n: rho_n ?? opt.rho_n,
+    rho_d: rho_d ?? opt.rho_d,
+  };
 }
 
 export function formatParams(n: number): string {
@@ -134,7 +147,7 @@ export function isoflopCurve(
   const ls: number[] = [];
   for (let i = 0; i < points; i++) {
     const t = i / (points - 1);
-    const n = center / span * Math.pow(span * span, t);
+    const n = (center / span) * Math.pow(span * span, t);
     const d = compute / (6 * n);
     ns.push(n);
     ds.push(d);
@@ -180,11 +193,15 @@ export function computeForLoss(
   return Math.exp(0.5 * (lo + hi));
 }
 
-export function compareAtBudget(compute: number, ids: string[] = OPTIMIZERS.map((o) => o.id)) {
-  const adamw = getOptimizer("adamw");
+export function compareAtBudget(
+  compute: number,
+  ids: string[] = OPTIMIZERS.map((o) => o.id),
+  optOverride?: (id: string) => OptimizerMeta,
+) {
+  const adamw = optOverride?.("adamw") ?? getOptimizer("adamw");
   const base = allocate(compute, adamw);
   return ids.map((id) => {
-    const opt = getOptimizer(id);
+    const opt = optOverride?.(id) ?? getOptimizer(id);
     const alloc = allocate(compute, opt);
     const matchCompute = computeForLoss(base.loss, opt);
     return {
@@ -195,4 +212,42 @@ export function compareAtBudget(compute: number, ids: string[] = OPTIMIZERS.map(
       matchCompute,
     };
   });
+}
+
+/** ρ_N × ρ_D → relative ΔN* vs AdamW at fixed budget (sensitivity heatmap). */
+export function rhoSensitivityGrid(
+  compute: number,
+  rhoNRange: [number, number] = [0.8, 2.0],
+  rhoDRange: [number, number] = [0.8, 2.0],
+  steps = 24,
+  p: ChinchillaParams = DEFAULT_PARAMS,
+): { rhoN: number[]; rhoD: number[]; deltaN: number[][]; loss: number[][] } {
+  const adamw = allocate(compute, getOptimizer("adamw"), p);
+  const rhoN: number[] = [];
+  const rhoD: number[] = [];
+  for (let i = 0; i < steps; i++) {
+    const t = i / (steps - 1);
+    rhoN.push(rhoNRange[0] + t * (rhoNRange[1] - rhoNRange[0]));
+    rhoD.push(rhoDRange[0] + t * (rhoDRange[1] - rhoDRange[0]));
+  }
+  const deltaN: number[][] = [];
+  const lossGrid: number[][] = [];
+  for (let j = 0; j < steps; j++) {
+    const rowN: number[] = [];
+    const rowL: number[] = [];
+    for (let i = 0; i < steps; i++) {
+      const opt: OptimizerMeta = {
+        id: "custom",
+        label: "custom",
+        rho_n: rhoN[i],
+        rho_d: rhoD[j],
+      };
+      const alloc = allocate(compute, opt, p);
+      rowN.push((alloc.N - adamw.N) / adamw.N);
+      rowL.push(alloc.loss);
+    }
+    deltaN.push(rowN);
+    lossGrid.push(rowL);
+  }
+  return { rhoN, rhoD, deltaN, loss: lossGrid };
 }

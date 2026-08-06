@@ -50,14 +50,7 @@ def allocate_for_budget(
     if compute <= 0:
         raise ValueError("compute must be positive")
     params = params or ChinchillaParams()
-    rho = OptimizerRho.from_name(optimizer)
-    if rho_n is not None or rho_d is not None:
-        rho = OptimizerRho(
-            name=rho.name,
-            rho_n=rho_n if rho_n is not None else rho.rho_n,
-            rho_d=rho_d if rho_d is not None else rho.rho_d,
-            label=rho.label,
-        )
+    rho = _resolve_rho(optimizer, rho_n, rho_d)
     n, d = _optimal_nd_closed_form(compute, params, rho)
     loss = float(chinchilla_loss(n, d, params, rho))
     return {
@@ -76,16 +69,34 @@ def allocate_for_budget(
     }
 
 
+def _resolve_rho(
+    optimizer: str,
+    rho_n: float | None = None,
+    rho_d: float | None = None,
+) -> OptimizerRho:
+    rho = OptimizerRho.from_name(optimizer)
+    if rho_n is not None or rho_d is not None:
+        rho = OptimizerRho(
+            name=rho.name,
+            rho_n=rho_n if rho_n is not None else rho.rho_n,
+            rho_d=rho_d if rho_d is not None else rho.rho_d,
+            label=rho.label,
+        )
+    return rho
+
+
 def allocate_fixed_n(
     n: float,
     compute: float | None = None,
     target_loss: float | None = None,
     optimizer: str = "adamw",
     params: ChinchillaParams | None = None,
+    rho_n: float | None = None,
+    rho_d: float | None = None,
 ) -> dict[str, Any]:
     """Fix model size N; solve for D given compute or target loss."""
     params = params or ChinchillaParams()
-    rho = OptimizerRho.from_name(optimizer)
+    rho = _resolve_rho(optimizer, rho_n, rho_d)
     if compute is not None:
         d = compute / (6.0 * n)
     elif target_loss is not None:
@@ -107,6 +118,8 @@ def allocate_fixed_n(
         "compute": float(compute),
         "loss": loss,
         "tokens_per_param": tokens_per_param(n, d),
+        "rho_n": rho.rho_n,
+        "rho_d": rho.rho_d,
         "N_human": format_params(n),
         "D_human": format_params(d),
         "compute_human": format_flops(float(compute)),
@@ -118,6 +131,8 @@ def allocate_fixed_ratio(
     tokens_per_param_ratio: float,
     optimizer: str = "adamw",
     params: ChinchillaParams | None = None,
+    rho_n: float | None = None,
+    rho_d: float | None = None,
 ) -> dict[str, Any]:
     """Allocate under fixed D/N = r (e.g. overtrain at 100 tok/param)."""
     if tokens_per_param_ratio <= 0:
@@ -126,7 +141,7 @@ def allocate_fixed_ratio(
     n = np.sqrt(compute / (6.0 * tokens_per_param_ratio))
     d = tokens_per_param_ratio * n
     params = params or ChinchillaParams()
-    rho = OptimizerRho.from_name(optimizer)
+    rho = _resolve_rho(optimizer, rho_n, rho_d)
     loss = float(chinchilla_loss(n, d, params, rho))
     return {
         "optimizer": rho.name,
@@ -136,6 +151,8 @@ def allocate_fixed_ratio(
         "loss": loss,
         "tokens_per_param": float(tokens_per_param_ratio),
         "constraint": "fixed_ratio",
+        "rho_n": rho.rho_n,
+        "rho_d": rho.rho_d,
         "N_human": format_params(float(n)),
         "D_human": format_params(float(d)),
         "compute_human": format_flops(compute),
@@ -146,6 +163,8 @@ def compute_for_target_loss(
     target_loss: float,
     optimizer: str = "adamw",
     params: ChinchillaParams | None = None,
+    rho_n: float | None = None,
+    rho_d: float | None = None,
     c_min: float = 1e18,
     c_max: float = 1e28,
 ) -> dict[str, Any]:
@@ -158,7 +177,9 @@ def compute_for_target_loss(
 
     def objective(log_c: float) -> float:
         c = float(np.exp(log_c))
-        alloc = allocate_for_budget(c, optimizer=optimizer, params=params)
+        alloc = allocate_for_budget(
+            c, optimizer=optimizer, params=params, rho_n=rho_n, rho_d=rho_d
+        )
         return (alloc["loss"] - target_loss) ** 2
 
     result = minimize_scalar(
@@ -167,7 +188,9 @@ def compute_for_target_loss(
         method="bounded",
     )
     compute = float(np.exp(result.x))
-    alloc = allocate_for_budget(compute, optimizer=optimizer, params=params)
+    alloc = allocate_for_budget(
+        compute, optimizer=optimizer, params=params, rho_n=rho_n, rho_d=rho_d
+    )
     alloc["target_loss"] = target_loss
     alloc["solved"] = bool(result.success) and abs(alloc["loss"] - target_loss) < 1e-3
     return alloc
@@ -202,13 +225,32 @@ def isoflop_curve(
     }
 
 
+def _rho_kwargs(
+    name: str,
+    rho_overrides: dict[str, OptimizerRho | dict[str, Any]] | None,
+) -> dict[str, float]:
+    if not rho_overrides or name not in rho_overrides:
+        return {}
+    meta = rho_overrides[name]
+    if isinstance(meta, OptimizerRho):
+        return {"rho_n": meta.rho_n, "rho_d": meta.rho_d}
+    return {
+        "rho_n": float(meta.get("rho_n", 1.0)),
+        "rho_d": float(meta.get("rho_d", 1.0)),
+    }
+
+
 def compare_optimizers(
     compute: float,
     optimizers: list[str] | None = None,
     params: ChinchillaParams | None = None,
+    rho_overrides: dict[str, OptimizerRho | dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     optimizers = optimizers or ["adamw", "muon", "normuon", "soap"]
-    rows = [allocate_for_budget(compute, opt, params=params) for opt in optimizers]
+    rows = [
+        allocate_for_budget(compute, opt, params=params, **_rho_kwargs(opt, rho_overrides))
+        for opt in optimizers
+    ]
     base = next(r for r in rows if r["optimizer"] == "adamw") if "adamw" in optimizers else rows[0]
     for row in rows:
         row["delta_N_vs_ref"] = row["N"] - base["N"]
@@ -217,12 +259,18 @@ def compare_optimizers(
         row["loss_delta_vs_ref"] = row["loss"] - base["loss"]
         row["compute_savings_vs_adamw_same_loss"] = None
     # Same-loss savings vs AdamW
-    adamw_loss = allocate_for_budget(compute, "adamw", params=params)["loss"]
+    adamw_kw = _rho_kwargs("adamw", rho_overrides)
+    adamw_loss = allocate_for_budget(compute, "adamw", params=params, **adamw_kw)["loss"]
     for row in rows:
         if row["optimizer"] == "adamw":
             row["compute_savings_vs_adamw_same_loss"] = 0.0
             continue
-        needed = compute_for_target_loss(adamw_loss, optimizer=row["optimizer"], params=params)
+        needed = compute_for_target_loss(
+            adamw_loss,
+            optimizer=row["optimizer"],
+            params=params,
+            **_rho_kwargs(row["optimizer"], rho_overrides),
+        )
         row["compute_to_match_adamw_loss"] = needed["compute"]
         row["compute_savings_vs_adamw_same_loss"] = 1.0 - needed["compute"] / compute
     return rows

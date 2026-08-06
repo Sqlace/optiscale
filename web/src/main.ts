@@ -6,13 +6,16 @@ import {
   allocate,
   allocateFixedRatio,
   compareAtBudget,
+  computeForLoss,
   flopsFromGpus,
   formatFlops,
   formatParams,
   getGpu,
   getOptimizer,
   isoflopCurve,
+  rhoSensitivityGrid,
   wallclock,
+  withRho,
   type OptimizerMeta,
 } from "./engine";
 
@@ -27,11 +30,17 @@ type State = {
   ratioMode: boolean;
   ratio: number;
   selected: string[];
+  /** Practitioner custom ρ (editable; seeded from catalog). */
+  rhoN: number;
+  rhoD: number;
+  targetLoss: number | null;
+  targetLossMode: boolean;
 };
 
-const STORAGE_KEY = "optiscale-scenario-v1";
+const STORAGE_KEY = "optiscale-scenario-v2";
 
 function defaultState(): State {
+  const muon = getOptimizer("muon");
   return {
     theme: "dark",
     tab: "practice",
@@ -43,6 +52,10 @@ function defaultState(): State {
     ratioMode: false,
     ratio: 100,
     selected: ["adamw", "muon", "normuon", "soap"],
+    rhoN: muon.rho_n,
+    rhoD: muon.rho_d,
+    targetLoss: null,
+    targetLossMode: false,
   };
 }
 
@@ -67,6 +80,14 @@ function loadState(): State {
 }
 
 let state = loadState();
+
+/** Research-tab last fit ρ summary for "Apply ρ to Practitioner". */
+let lastFitRhos: Record<string, { rho_n: number; rho_d: number; label: string }> = {};
+
+function activeOpt(): OptimizerMeta {
+  const base = getOptimizer(state.optimizer);
+  return withRho(base, state.rhoN, state.rhoD);
+}
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -111,8 +132,8 @@ function renderShell() {
     <div id="view"></div>
     <footer class="footer">
       Part of the <strong>Spectral Training Stack</strong> with
-      <a href="https://github.com/spectral-training/spectoptim">SpectOptim</a> and
-      <a href="https://github.com/spectral-training/ortholab">OrthoLab</a>.
+      <a href="https://github.com/Sqlace/spectoptim">SpectOptim</a> and
+      <a href="https://github.com/Sqlace/ortholab">OrthoLab</a>.
       ρ priors are planning defaults — fit your own runs for production.
       Inspired by Hoffmann et al. (2022) and Volkova et al. (2026).
       <code class="mono">pip install optiscale</code>
@@ -142,12 +163,21 @@ function renderShell() {
 
 function renderPractice() {
   const gpu = getGpu(state.gpu);
-  const opt = getOptimizer(state.optimizer);
-  const alloc = state.ratioMode
-    ? allocateFixedRatio(state.flops, state.ratio, opt)
-    : allocate(state.flops, opt);
-  const wall = wallclock(state.flops, gpu, state.count, state.mfu);
-  const rows = compareAtBudget(state.flops, state.selected);
+  const opt = activeOpt();
+  let displayFlops = state.flops;
+  let alloc;
+  let inverseNote = "";
+  if (state.targetLossMode && state.targetLoss != null && state.targetLoss > 1.69) {
+    displayFlops = computeForLoss(state.targetLoss, opt);
+    alloc = allocate(displayFlops, opt);
+    inverseNote = `Inverse solve: C* ≈ ${formatFlops(displayFlops)} to reach L=${state.targetLoss}`;
+  } else if (state.ratioMode) {
+    alloc = allocateFixedRatio(state.flops, state.ratio, opt);
+  } else {
+    alloc = allocate(state.flops, opt);
+  }
+  const wall = wallclock(displayFlops, gpu, state.count, state.mfu);
+  const rows = compareAtBudget(displayFlops, state.selected);
 
   el("#view").innerHTML = `
     <div class="grid">
@@ -155,7 +185,7 @@ function renderPractice() {
         <h2>Budget</h2>
         <div class="row" id="presets"></div>
         <label>FLOP budget C
-          <input id="flopsInput" type="text" value="${state.flops.toExponential(3)}" />
+          <input id="flopsInput" type="text" value="${displayFlops.toExponential(3)}" ${state.targetLossMode ? "disabled" : ""} />
         </label>
         <label>Or GPU-hours → FLOPs
           <div class="row">
@@ -166,22 +196,33 @@ function renderPractice() {
           <input id="countInput" type="number" min="1" value="${state.count}" />
         </label>
         <label>Hours
-          <input id="hoursInput" type="number" min="0.1" step="0.1" value="${(wall.hours).toFixed(1)}" />
+          <input id="hoursInput" type="number" min="0.1" step="0.1" value="${wall.hours.toFixed(1)}" ${state.targetLossMode ? "disabled" : ""} />
         </label>
         <label>MFU ${(state.mfu * 100).toFixed(0)}%
           <input id="mfuInput" type="range" min="0.15" max="0.7" step="0.01" value="${state.mfu}" />
         </label>
         <label>Optimizer
-          <select id="optSel">${OPTIMIZERS.map((o) => `<option value="${o.id}" ${o.id === state.optimizer ? "selected" : ""}>${o.label} (ρN=${o.rho_n}, ρD=${o.rho_d})</option>`).join("")}</select>
+          <select id="optSel">${OPTIMIZERS.map((o) => `<option value="${o.id}" ${o.id === state.optimizer ? "selected" : ""}>${o.label}</option>`).join("")}</select>
         </label>
-        <label><input id="ratioMode" type="checkbox" ${state.ratioMode ? "checked" : ""}/> Fix tokens/param ratio</label>
-        <label class="${state.ratioMode ? "" : "hidden"}">Tokens / param
+        <label>Custom ρ<sub>N</sub>
+          <input id="rhoNInput" type="number" min="0.1" max="5" step="0.01" value="${state.rhoN}" />
+        </label>
+        <label>Custom ρ<sub>D</sub>
+          <input id="rhoDInput" type="number" min="0.1" max="5" step="0.01" value="${state.rhoD}" />
+        </label>
+        <label><input id="ratioMode" type="checkbox" ${state.ratioMode ? "checked" : ""} ${state.targetLossMode ? "disabled" : ""}/> Fix tokens/param ratio</label>
+        <label class="${state.ratioMode && !state.targetLossMode ? "" : "hidden"}">Tokens / param
           <input id="ratioInput" type="number" min="1" value="${state.ratio}" />
         </label>
-        <p class="muted">Presets and URL state are saved locally. Override ρ in the Research tab after fitting.</p>
+        <label><input id="targetLossMode" type="checkbox" ${state.targetLossMode ? "checked" : ""}/> Target-loss inverse</label>
+        <label class="${state.targetLossMode ? "" : "hidden"}">Target loss L
+          <input id="targetLossInput" type="number" min="1.7" max="10" step="0.01" value="${state.targetLoss ?? 2.5}" />
+        </label>
+        <p class="muted">ρ fields override catalog priors for the selected optimizer. Use Research → Apply ρ to seed from a fit.</p>
       </aside>
       <section class="panel">
-        <h2>Allocation — ${opt.label}</h2>
+        <h2>Allocation — ${opt.label} (ρN=${opt.rho_n}, ρD=${opt.rho_d})</h2>
+        ${inverseNote ? `<p class="muted">${inverseNote}</p>` : ""}
         <div class="cards">
           <div class="card"><div class="k">N*</div><div class="v accent">${formatParams(alloc.N)}</div></div>
           <div class="card"><div class="k">D*</div><div class="v">${formatParams(alloc.D)}</div></div>
@@ -192,6 +233,9 @@ function renderPractice() {
         </div>
         <h2>IsoFLOP curve</h2>
         <canvas id="isoCanvas" width="900" height="360"></canvas>
+        <h2>ρ sensitivity — ΔN* vs AdamW</h2>
+        <p class="muted">Heatmap of relative ΔN* = (N*(ρ) − N*_AdamW) / N*_AdamW at the current FLOP budget.</p>
+        <canvas id="heatCanvas" width="480" height="420"></canvas>
         <h2>Multi-optimizer compare</h2>
         <div class="row" id="optChips"></div>
         <table>
@@ -276,11 +320,31 @@ function renderPractice() {
   };
   el<HTMLSelectElement>("#optSel").onchange = (e) => {
     state.optimizer = (e.target as HTMLSelectElement).value;
+    const o = getOptimizer(state.optimizer);
+    state.rhoN = o.rho_n;
+    state.rhoD = o.rho_d;
     saveState();
     render();
   };
+  const syncRho = (e: Event) => {
+    const target = e.target as HTMLInputElement;
+    const which = target.id;
+    state.rhoN = Number(el<HTMLInputElement>("#rhoNInput").value);
+    state.rhoD = Number(el<HTMLInputElement>("#rhoDInput").value);
+    saveState();
+    render();
+    const restored = document.getElementById(which) as HTMLInputElement | null;
+    if (restored) {
+      restored.focus();
+      const len = restored.value.length;
+      restored.setSelectionRange(len, len);
+    }
+  };
+  el<HTMLInputElement>("#rhoNInput").oninput = syncRho;
+  el<HTMLInputElement>("#rhoDInput").oninput = syncRho;
   el<HTMLInputElement>("#ratioMode").onchange = (e) => {
     state.ratioMode = (e.target as HTMLInputElement).checked;
+    if (state.ratioMode) state.targetLossMode = false;
     saveState();
     render();
   };
@@ -292,9 +356,26 @@ function renderPractice() {
       render();
     };
   }
+  el<HTMLInputElement>("#targetLossMode").onchange = (e) => {
+    state.targetLossMode = (e.target as HTMLInputElement).checked;
+    if (state.targetLossMode) {
+      state.ratioMode = false;
+      if (state.targetLoss == null) state.targetLoss = 2.5;
+    }
+    saveState();
+    render();
+  };
+  const tlInput = document.querySelector("#targetLossInput") as HTMLInputElement | null;
+  if (tlInput) {
+    tlInput.onchange = (e) => {
+      state.targetLoss = Number((e.target as HTMLInputElement).value);
+      saveState();
+      render();
+    };
+  }
   el("#copyPy").onclick = async () => {
     const snip = `from optiscale import allocate_for_budget, cost_report
-alloc = allocate_for_budget(${state.flops.toExponential()}, optimizer="${state.optimizer}")
+alloc = allocate_for_budget(${state.flops.toExponential()}, optimizer="${state.optimizer}", rho_n=${state.rhoN}, rho_d=${state.rhoD})
 print(alloc)
 print(cost_report(compute=${state.flops.toExponential()}, gpu_id="${state.gpu}", count=${state.count}))
 `;
@@ -302,14 +383,15 @@ print(cost_report(compute=${state.flops.toExponential()}, gpu_id="${state.gpu}",
     await navigator.clipboard.writeText(snip);
   };
 
-  drawIsoflop(opt);
+  drawIsoflop(opt, displayFlops);
+  drawRhoHeatmap(displayFlops);
 }
 
-function drawIsoflop(opt: OptimizerMeta) {
+function drawIsoflop(opt: OptimizerMeta, flops = state.flops) {
   const canvas = el<HTMLCanvasElement>("#isoCanvas");
   const ctx = canvas.getContext("2d")!;
-  const curve = isoflopCurve(state.flops, opt);
-  const adamwCurve = isoflopCurve(state.flops, getOptimizer("adamw"));
+  const curve = isoflopCurve(flops, opt);
+  const adamwCurve = isoflopCurve(flops, getOptimizer("adamw"));
   const w = canvas.width;
   const h = canvas.height;
   const pad = 48;
@@ -320,7 +402,8 @@ function drawIsoflop(opt: OptimizerMeta) {
   const minN = Math.min(...curve.N);
   const maxN = Math.max(...curve.N);
 
-  const xOf = (n: number) => pad + ((Math.log(n) - Math.log(minN)) / (Math.log(maxN) - Math.log(minN))) * (w - 2 * pad);
+  const xOf = (n: number) =>
+    pad + ((Math.log(n) - Math.log(minN)) / (Math.log(maxN) - Math.log(minN))) * (w - 2 * pad);
   const yOf = (l: number) => h - pad - ((l - minL) / (maxL - minL || 1)) * (h - 2 * pad);
 
   ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--line");
@@ -364,9 +447,69 @@ function drawIsoflop(opt: OptimizerMeta) {
   ctx.fillText(opt.label, w - pad - 120, pad + 24);
 }
 
+function drawRhoHeatmap(flops = state.flops) {
+  const canvas = el<HTMLCanvasElement>("#heatCanvas");
+  const ctx = canvas.getContext("2d")!;
+  const grid = rhoSensitivityGrid(flops, [0.8, 2.0], [0.8, 2.0], 28);
+  const padL = 56;
+  const padB = 48;
+  const padT = 24;
+  const padR = 24;
+  const w = canvas.width;
+  const h = canvas.height;
+  const cellW = (w - padL - padR) / grid.rhoN.length;
+  const cellH = (h - padT - padB) / grid.rhoD.length;
+  ctx.clearRect(0, 0, w, h);
+
+  let minV = Infinity;
+  let maxV = -Infinity;
+  for (const row of grid.deltaN) {
+    for (const v of row) {
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+  }
+  const span = maxV - minV || 1;
+
+  for (let j = 0; j < grid.rhoD.length; j++) {
+    for (let i = 0; i < grid.rhoN.length; i++) {
+      const v = grid.deltaN[j][i];
+      const t = (v - minV) / span;
+      // cool → warm: blue (more params) to green/amber (fewer)
+      const r = Math.round(40 + t * 180);
+      const g = Math.round(80 + (1 - Math.abs(t - 0.5) * 2) * 120);
+      const b = Math.round(160 - t * 120);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      // j=0 is low ρD at bottom
+      const y = h - padB - (j + 1) * cellH;
+      ctx.fillRect(padL + i * cellW, y, cellW + 0.5, cellH + 0.5);
+    }
+  }
+
+  // Mark current ρ
+  const xi = (state.rhoN - 0.8) / (2.0 - 0.8);
+  const yi = (state.rhoD - 0.8) / (2.0 - 0.8);
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(padL + xi * (w - padL - padR), h - padB - yi * (h - padT - padB), 6, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#888";
+  ctx.font = "11px IBM Plex Mono";
+  ctx.fillText("ρ_N →", padL + (w - padL - padR) / 2 - 16, h - 14);
+  ctx.save();
+  ctx.translate(14, h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("ρ_D →", 0, 0);
+  ctx.restore();
+  ctx.fillText(`ΔN* [${(minV * 100).toFixed(0)}%, ${(maxV * 100).toFixed(0)}%]`, padL, 16);
+}
+
 function applyPreset(id: string) {
   const p = PRESETS.find((x) => x.id === id);
   if (!p) return;
+  state.targetLossMode = false;
   if (p.kind === "flops") {
     state.flops = p.value;
     state.ratioMode = Boolean(p.ratio);
@@ -389,6 +532,7 @@ function applyPreset(id: string) {
 }
 
 function renderResearch() {
+  const fitKeys = Object.keys(lastFitRhos);
   el("#view").innerHTML = `
     <div class="panel">
       <h2>Shared-exponent vs separate fits</h2>
@@ -400,6 +544,16 @@ function renderResearch() {
       <div class="row" style="margin-top:0.75rem">
         <button class="icon-btn" id="synthBtn">Load synthetic demo</button>
         <button class="icon-btn" id="fitBtn">Compare fit strategies</button>
+        <button class="icon-btn" id="applyRhoBtn" ${fitKeys.length ? "" : "disabled"}>Apply ρ to Practitioner</button>
+        <select id="applyOptSel" ${fitKeys.length ? "" : "disabled"}>
+          ${
+            fitKeys.length
+              ? fitKeys
+                  .map((k) => `<option value="${k}">${lastFitRhos[k].label} (ρN=${lastFitRhos[k].rho_n.toFixed(2)})</option>`)
+                  .join("")
+              : `<option value="">Run fit first</option>`
+          }
+        </select>
       </div>
       <div id="fitOut" class="muted">Results appear here.</div>
     </div>
@@ -412,7 +566,7 @@ function renderResearch() {
       for (const c of budgets) {
         const center = allocate(c, o).N;
         for (let i = 0; i < 8; i++) {
-          const n = center / 6 * Math.pow(36, i / 7);
+          const n = (center / 6) * Math.pow(36, i / 7);
           const d = c / (6 * n);
           const ne = n * o.rho_n;
           const de = d * o.rho_d;
@@ -435,7 +589,12 @@ function renderResearch() {
       .slice(1)
       .map((line) => line.split(","))
       .filter((p) => p.length >= 4)
-      .map((p) => ({ N: Number(p[0]), D: Number(p[1]), L: Number(p[2]), optimizer: p[3].trim().toLowerCase() }));
+      .map((p) => ({
+        N: Number(p[0]),
+        D: Number(p[1]),
+        L: Number(p[2]),
+        optimizer: p[3].trim().toLowerCase(),
+      }));
     const byOpt: Record<string, { N: number[]; D: number[]; L: number[] }> = {};
     for (const r of rows) {
       byOpt[r.optimizer] ??= { N: [], D: [], L: [] };
@@ -443,10 +602,18 @@ function renderResearch() {
       byOpt[r.optimizer].D.push(r.D);
       byOpt[r.optimizer].L.push(r.L);
     }
-    // Lightweight browser summary: mean residuals under default shared ρ vs AdamW-only
-    const summary: string[] = ["Browser fit summary (full L-BFGS lives in Python `optiscale fit`):", ""];
+    lastFitRhos = {};
+    const summary: string[] = [
+      "Browser fit summary (full L-BFGS lives in Python `optiscale fit`):",
+      "",
+    ];
     for (const [name, data] of Object.entries(byOpt)) {
-      const o = OPTIMIZERS.find((x) => x.id === name) ?? { id: name, label: name, rho_n: 1, rho_d: 1 };
+      const o = OPTIMIZERS.find((x) => x.id === name) ?? {
+        id: name,
+        label: name,
+        rho_n: 1,
+        rho_d: 1,
+      };
       let sse = 0;
       for (let i = 0; i < data.N.length; i++) {
         const ne = data.N[i] * o.rho_n;
@@ -455,13 +622,38 @@ function renderResearch() {
         sse += (pred - data.L[i]) ** 2;
       }
       const rmse = Math.sqrt(sse / data.N.length);
-      summary.push(`${o.label}: n=${data.N.length}  RMSE under prior ρ = ${rmse.toFixed(4)}  (ρN=${o.rho_n}, ρD=${o.rho_d})`);
+      summary.push(
+        `${o.label}: n=${data.N.length}  RMSE under prior ρ = ${rmse.toFixed(4)}  (ρN=${o.rho_n}, ρD=${o.rho_d})`,
+      );
+      lastFitRhos[name] = { rho_n: o.rho_n, rho_d: o.rho_d, label: o.label };
     }
     summary.push("", "Run for full shared-exponent fit + bootstrap CI:");
     summary.push("  pip install -e .");
-    summary.push("  optiscale fit --synthetic");
-    summary.push("  optiscale fit --data runs.csv");
+    summary.push("  optiscale fit --synthetic --bootstrap 200 --out fit.json");
+    summary.push("  optiscale compare --flops 1e24 --fit fit.json");
     el("#fitOut").textContent = summary.join("\n");
+    // Refresh apply controls without wiping textarea
+    const applyBtn = el<HTMLButtonElement>("#applyRhoBtn");
+    const applySel = el<HTMLSelectElement>("#applyOptSel");
+    applyBtn.disabled = false;
+    applySel.disabled = false;
+    applySel.innerHTML = Object.keys(lastFitRhos)
+      .map(
+        (k) =>
+          `<option value="${k}">${lastFitRhos[k].label} (ρN=${lastFitRhos[k].rho_n.toFixed(2)})</option>`,
+      )
+      .join("");
+  };
+  el("#applyRhoBtn").onclick = () => {
+    const sel = el<HTMLSelectElement>("#applyOptSel").value;
+    const meta = lastFitRhos[sel];
+    if (!meta) return;
+    if (OPTIMIZERS.some((o) => o.id === sel)) state.optimizer = sel;
+    state.rhoN = meta.rho_n;
+    state.rhoD = meta.rho_d;
+    state.tab = "practice";
+    saveState();
+    render();
   };
 }
 
@@ -484,7 +676,11 @@ function renderFormula() {
       <h2>Python</h2>
       <pre class="mono muted">pip install optiscale
 optiscale allocate --flops 1e24 --optimizer muon
-optiscale compare --budget-usd 1000000 --gpu h100 --count 64
+optiscale allocate --fixed-n 7e9 --flops 1e23
+optiscale allocate --ratio 100 --flops 1e23
+optiscale allocate --target-loss 2.5 --optimizer muon
+optiscale fit --synthetic --bootstrap 200 --out fit.json
+optiscale compare --budget-usd 1000000 --gpu h100 --count 64 --fit fit.json --md report.md
 optiscale report --flops 1e24 --md report.md</pre>
     </div>
   `;
@@ -501,6 +697,7 @@ function exportMarkdown() {
     `- GPU: ${gpu.name} × ${state.count} @ MFU ${state.mfu}`,
     `- Wall-clock: ${wall.days.toFixed(2)} days`,
     `- Cost: $${wall.cost.toFixed(0)}`,
+    `- Practitioner ρ: ρN=${state.rhoN}, ρD=${state.rhoD}`,
     "",
     "| Optimizer | N* | D* | Loss | N/AdamW | Compute saved |",
     "|---|---:|---:|---:|---:|---:|",

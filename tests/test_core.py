@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -13,8 +16,10 @@ from optiscale.allocate import (
     compute_for_target_loss,
     isoflop_curve,
 )
+from optiscale.cli import main
 from optiscale.cost import budget_from_gpus, cost_report, flops_to_wallclock
 from optiscale.fit import compare_fit_strategies, fit_chinchilla, simulate_isoflop_data
+from optiscale.io import load_fit_json, params_from_fit, save_fit_json
 from optiscale.laws import ChinchillaParams, OptimizerRho, chinchilla_loss, flops
 
 
@@ -67,6 +72,18 @@ def test_rho_closed_form_matches_grid_when_alpha_ne_beta():
     assert closed["loss"] == pytest.approx(float(losses[i]), rel=1e-5)
 
 
+def test_foc_identity_at_n_star_varied_rho():
+    """First-order condition: α A / (ρ_N N*)^α = β B / (ρ_D D*)^β."""
+    params = ChinchillaParams()
+    compute = 1e23
+    for rho_n, rho_d in [(1.0, 1.0), (1.35, 1.25), (1.8, 0.9), (0.9, 1.6)]:
+        alloc = allocate_for_budget(compute, "adamw", params=params, rho_n=rho_n, rho_d=rho_d)
+        n, d = alloc["N"], alloc["D"]
+        lhs = params.alpha * params.A / (rho_n * n) ** params.alpha
+        rhs = params.beta * params.B / (rho_d * d) ** params.beta
+        assert lhs == pytest.approx(rhs, rel=1e-6)
+
+
 def test_target_loss_solver():
     base = allocate_for_budget(1e21, "adamw")
     solved = compute_for_target_loss(base["loss"], "adamw")
@@ -87,6 +104,7 @@ def test_cost_and_gpu_budget():
     report = cost_report(compute=1e23, gpu_id="a100", count=16)
     assert "allocations" in report
     assert len(report["savings_vs_adamw_loss"]) >= 1
+    assert "ρ" in report["rho_disclaimer"] or "rho" in report["rho_disclaimer"].lower()
 
 
 def test_compare_optimizers():
@@ -117,6 +135,81 @@ def test_shared_vs_separate_fit():
     assert cmp["shared"]["rhos"]["muon"]["rho_n"] > 1.0
 
 
+def test_fit_json_roundtrip(tmp_path: Path):
+    true = ChinchillaParams()
+    adamw = simulate_isoflop_data(params=true, optimizer="adamw", noise_std=0.0, seed=0)
+    muon = simulate_isoflop_data(params=true, optimizer="muon", noise_std=0.0, seed=1)
+    runs = {
+        "adamw": {"N": adamw["N"], "D": adamw["D"], "L": adamw["L"]},
+        "muon": {"N": muon["N"], "D": muon["D"], "L": muon["L"]},
+    }
+    cmp = compare_fit_strategies(runs)
+    path = tmp_path / "fit.json"
+    save_fit_json(cmp, path)
+    loaded = load_fit_json(path)
+    params, rhos = params_from_fit(loaded)
+    assert params.alpha == pytest.approx(cmp["shared"]["params"]["alpha"], rel=1e-9)
+    assert rhos["muon"].rho_n == pytest.approx(cmp["shared"]["rhos"]["muon"]["rho_n"], rel=1e-9)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema"] == "optiscale.fit.v1"
+
+
+def test_cost_report_with_fit_applies_rho():
+    """Fitted ρ overrides must change allocations vs planning priors."""
+    prior = cost_report(compute=1e23, optimizers=["adamw", "muon"])
+    fake_rhos = {
+        "adamw": OptimizerRho("adamw", 1.0, 1.0, "AdamW"),
+        "muon": OptimizerRho("muon", 2.0, 1.5, "Muon"),
+    }
+    fitted = cost_report(
+        compute=1e23,
+        optimizers=["adamw", "muon"],
+        rho_overrides=fake_rhos,
+    )
+    prior_muon = next(r for r in prior["allocations"] if r["optimizer"] == "muon")
+    fit_muon = next(r for r in fitted["allocations"] if r["optimizer"] == "muon")
+    assert fit_muon["rho_n"] == pytest.approx(2.0)
+    assert fit_muon["N"] != pytest.approx(prior_muon["N"], rel=1e-3)
+    assert fitted["used_fitted_rhos"] is True
+
+
+def test_compare_budget_usd_with_fit_applies_rho(tmp_path: Path, capsys):
+    true = ChinchillaParams()
+    adamw = simulate_isoflop_data(params=true, optimizer="adamw", noise_std=0.0, seed=0)
+    muon = simulate_isoflop_data(params=true, optimizer="muon", noise_std=0.0, seed=1)
+    runs = {
+        "adamw": {"N": adamw["N"], "D": adamw["D"], "L": adamw["L"]},
+        "muon": {"N": muon["N"], "D": muon["D"], "L": muon["L"]},
+    }
+    cmp = compare_fit_strategies(runs)
+    fit_path = tmp_path / "fit.json"
+    save_fit_json(cmp, fit_path)
+    md_path = tmp_path / "out.md"
+    rc = main(
+        [
+            "compare",
+            "--budget-usd",
+            "100000",
+            "--gpu",
+            "h100",
+            "--count",
+            "8",
+            "--optimizers",
+            "adamw,muon",
+            "--fit",
+            str(fit_path),
+            "--md",
+            str(md_path),
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    muon_row = next(r for r in out if r["optimizer"] == "muon")
+    assert muon_row["rho_n"] == pytest.approx(cmp["shared"]["rhos"]["muon"]["rho_n"], rel=1e-6)
+    md = md_path.read_text(encoding="utf-8")
+    assert "fit" in md.lower() or "ρ" in md
+
+
 def test_optimizer_rho_unknown():
     with pytest.raises(KeyError):
         OptimizerRho.from_name("not-an-opt")
@@ -127,3 +220,12 @@ def test_loss_decreases_with_more_data():
     l1 = chinchilla_loss(n, 1e10)
     l2 = chinchilla_loss(n, 1e11)
     assert l2 < l1
+
+
+def test_cli_allocate_modes_smoke(capsys):
+    assert main(["allocate", "--flops", "1e22", "--optimizer", "muon"]) == 0
+    assert main(["allocate", "--fixed-n", "1e9", "--flops", "1e21"]) == 0
+    assert main(["allocate", "--ratio", "100", "--flops", "1e21"]) == 0
+    assert main(["allocate", "--target-loss", "2.8", "--optimizer", "adamw"]) == 0
+    out = capsys.readouterr().out
+    assert "N" in out

@@ -7,7 +7,13 @@ import json
 import sys
 from typing import Any
 
-from .allocate import allocate_for_budget, compare_optimizers, isoflop_curve
+from .allocate import (
+    allocate_fixed_n,
+    allocate_fixed_ratio,
+    allocate_for_budget,
+    compute_for_target_loss,
+    isoflop_curve,
+)
 from .cost import budget_from_gpus, cost_report, list_gpus
 from .fit import compare_fit_strategies, simulate_isoflop_data
 from .io import (
@@ -19,7 +25,7 @@ from .io import (
     save_fit_json,
     save_markdown_report,
 )
-from .laws import ChinchillaParams, list_optimizers
+from .laws import list_optimizers
 
 
 def _print(data: Any) -> None:
@@ -34,7 +40,29 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("allocate", help="Compute-optimal N*, D* for a FLOP budget")
-    a.add_argument("--flops", type=float, required=True)
+    a.add_argument("--flops", type=float, default=None, help="FLOP budget C (required except --target-loss)")
+    mode = a.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--fixed-n",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Fix model size N; needs --flops (or use allocate_fixed_n with compute)",
+    )
+    mode.add_argument(
+        "--ratio",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Fix tokens/param ratio; requires --flops",
+    )
+    mode.add_argument(
+        "--target-loss",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Inverse: min compute for target loss (--flops optional)",
+    )
     a.add_argument("--optimizer", default="adamw")
     a.add_argument("--rho-n", type=float, default=None)
     a.add_argument("--rho-d", type=float, default=None)
@@ -55,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--data", default=None, help="Path to CSV/JSON runs")
     f.add_argument("--synthetic", action="store_true")
     f.add_argument("--noise", type=float, default=0.01)
+    f.add_argument(
+        "--bootstrap",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Bootstrap resamples for CI on separate + shared fits",
+    )
     f.add_argument("--out", default=None, help="Write fit.json for allocate --fit")
 
     r = sub.add_parser("report", help="Full cost + savings report")
@@ -64,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--count", type=int, default=8)
     r.add_argument("--mfu", type=float, default=None)
     r.add_argument("--md", default="optiscale-report.md")
+    r.add_argument("--fit", default=None, help="fit.json with fitted ρ overrides")
 
     i = sub.add_parser("isoflop", help="IsoFLOP loss curve JSON")
     i.add_argument("--flops", type=float, required=True)
@@ -85,70 +121,77 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _load_fit_kwargs(path: str | None, optimizer: str, rho_n: float | None, rho_d: float | None):
+    """Return (params, rho_n, rho_d) applying fit.json when present."""
+    params = None
+    if path:
+        fit = load_fit_json(path)
+        params, rhos = params_from_fit(fit)
+        if optimizer in rhos and rho_n is None and rho_d is None:
+            rho_n = rhos[optimizer].rho_n
+            rho_d = rhos[optimizer].rho_d
+    return params, rho_n, rho_d
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "allocate":
-        params = None
-        rho_n, rho_d = args.rho_n, args.rho_d
-        if args.fit:
-            fit = load_fit_json(args.fit)
-            params, rhos = params_from_fit(fit)
-            if args.optimizer in rhos and rho_n is None and rho_d is None:
-                rho_n = rhos[args.optimizer].rho_n
-                rho_d = rhos[args.optimizer].rho_d
-        _print(
-            allocate_for_budget(
-                args.flops,
-                optimizer=args.optimizer,
-                params=params,
-                rho_n=rho_n,
-                rho_d=rho_d,
-            )
+        params, rho_n, rho_d = _load_fit_kwargs(
+            args.fit, args.optimizer, args.rho_n, args.rho_d
         )
+        kw: dict[str, Any] = {
+            "optimizer": args.optimizer,
+            "params": params,
+            "rho_n": rho_n,
+            "rho_d": rho_d,
+        }
+        if args.fixed_n is not None:
+            if args.flops is None:
+                print("--fixed-n requires --flops", file=sys.stderr)
+                return 2
+            _print(allocate_fixed_n(args.fixed_n, compute=args.flops, **kw))
+        elif args.ratio is not None:
+            if args.flops is None:
+                print("--ratio requires --flops", file=sys.stderr)
+                return 2
+            _print(
+                allocate_fixed_ratio(
+                    args.flops, tokens_per_param_ratio=args.ratio, **kw
+                )
+            )
+        elif args.target_loss is not None:
+            _print(compute_for_target_loss(args.target_loss, **kw))
+        else:
+            if args.flops is None:
+                print("Provide --flops (or --target-loss / --fixed-n / --ratio)", file=sys.stderr)
+                return 2
+            _print(allocate_for_budget(args.flops, **kw))
     elif args.cmd == "compare":
         opts = [x.strip() for x in args.optimizers.split(",") if x.strip()]
-        compute = args.flops
         fit_params = None
         fit_rhos = None
         if getattr(args, "fit", None):
             fit = load_fit_json(args.fit)
             fit_params, fit_rhos = params_from_fit(fit)
-        if compute is None:
-            if args.budget_usd is None:
-                print("Provide --flops or --budget-usd", file=sys.stderr)
-                return 2
-            report = cost_report(
-                budget_usd=args.budget_usd,
-                gpu_id=args.gpu,
-                count=args.count,
-                mfu=args.mfu,
-                optimizers=opts,
-            )
-            compute = report["wallclock"]["compute"]
-            rows = report["allocations"]
+        report_kw: dict[str, Any] = {
+            "gpu_id": args.gpu,
+            "count": args.count,
+            "mfu": args.mfu,
+            "optimizers": opts,
+            "params": fit_params,
+            "rho_overrides": fit_rhos,
+        }
+        if args.flops is not None:
+            report = cost_report(compute=args.flops, **report_kw)
+        elif args.budget_usd is not None:
+            report = cost_report(budget_usd=args.budget_usd, **report_kw)
         else:
-            rows = []
-            for name in opts:
-                kw = {"params": fit_params} if fit_params else {}
-                if fit_rhos and name in fit_rhos:
-                    kw["rho_n"] = fit_rhos[name].rho_n
-                    kw["rho_d"] = fit_rhos[name].rho_d
-                rows.append(allocate_for_budget(compute, optimizer=name, **kw))
-            # ratios vs adamw
-            base = next((r for r in rows if r["optimizer"] == "adamw"), rows[0])
-            for row in rows:
-                row["N_ratio_vs_ref"] = row["N"] / base["N"]
-                row["delta_N_vs_ref"] = row["N"] - base["N"]
+            print("Provide --flops or --budget-usd", file=sys.stderr)
+            return 2
+        rows = report["allocations"]
         if args.csv:
             save_allocation_csv(rows, args.csv)
         if args.md:
-            report = cost_report(
-                compute=compute,
-                gpu_id=args.gpu,
-                count=args.count,
-                mfu=args.mfu,
-                optimizers=opts,
-            )
             save_markdown_report(report, args.md)
         _print(rows)
     elif args.cmd == "fit":
@@ -161,18 +204,25 @@ def main(argv: list[str] | None = None) -> int:
             }
         else:
             runs = load_runs(args.data)
-        result = compare_fit_strategies(runs)
+        result = compare_fit_strategies(runs, bootstrap=args.bootstrap)
         if args.out:
             save_fit_json(result, args.out)
             result = {**result, "wrote": args.out}
         _print(result)
     elif args.cmd == "report":
+        fit_params = None
+        fit_rhos = None
+        if getattr(args, "fit", None):
+            fit = load_fit_json(args.fit)
+            fit_params, fit_rhos = params_from_fit(fit)
         report = cost_report(
             compute=args.flops,
             budget_usd=args.budget_usd,
             gpu_id=args.gpu,
             count=args.count,
             mfu=args.mfu,
+            params=fit_params,
+            rho_overrides=fit_rhos,
         )
         save_markdown_report(report, args.md)
         _print({"wrote": args.md, "wallclock": report["wallclock"], "savings": report["savings_vs_adamw_loss"]})

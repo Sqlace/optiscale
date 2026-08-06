@@ -22,6 +22,37 @@ optiscale fit --synthetic
 optiscale report --flops 1e24 --gpu a100 --count 16
 ```
 
+### Fit → compare recipe
+
+```bash
+# Fit shared-exponent ρ with bootstrap CI, persist for reuse
+optiscale fit --synthetic --bootstrap 200 --out fit.json
+
+# Allocations / cost report honor fitted ρ (not planning priors)
+optiscale compare --flops 1e24 --fit fit.json --md report.md
+optiscale compare --budget-usd 1000000 --gpu h100 --count 64 --fit fit.json
+optiscale allocate --flops 1e24 --optimizer muon --fit fit.json
+```
+
+### Allocate modes
+
+| Flag | Behavior |
+|------|----------|
+| `--flops C` | Default: compute-optimal \(N^*, D^*\) via `allocate_for_budget` |
+| `--fixed-n N --flops C` | Fix model size; solve \(D = C/(6N)\) |
+| `--ratio R --flops C` | Fix tokens/param \(D/N = R\) (e.g. overtrain) |
+| `--target-loss L` | Inverse: min compute on the ridge for loss \(L\) (`--flops` optional) |
+| `--rho-n` / `--rho-d` | Override catalog ρ |
+| `--fit fit.json` | Load fitted params + ρ from `fit --out` |
+
+### Fit / compare flags
+
+| Flag | Behavior |
+|------|----------|
+| `fit --bootstrap N` | Bootstrap CI on separate Chinchilla + shared-exponent fits |
+| `fit --out fit.json` | Persist for `allocate` / `compare` / `report --fit` |
+| `compare --fit fit.json` | Re-allocate with fitted ρ (also applies to `--budget-usd` and `--md`) |
+
 ```python
 from optiscale import allocate_for_budget, cost_report, compare_fit_strategies
 from optiscale.fit import simulate_isoflop_data
@@ -39,9 +70,9 @@ print(report["savings_vs_adamw_loss"])
 cd web && npm install && npm run dev
 ```
 
-Practitioner dashboard: FLOP / GPU-hour budgets, presets ($1M, 8×H100×30d, overtrain), isoFLOP curves, multi-optimizer table, shareable URL state, Markdown/CSV export.
+Practitioner dashboard: FLOP / GPU-hour budgets, presets ($1M, 8×H100×30d, overtrain), editable ρ, target-loss inverse, isoFLOP curves, ρ-sensitivity heatmap, multi-optimizer table, shareable URL state, Markdown/CSV export.
 
-Research tab: CSV upload + synthetic IsoFLOP demo (full L-BFGS shared-exponent fit in the Python CLI).
+Research tab: CSV upload + synthetic IsoFLOP demo + **Apply ρ to Practitioner**. Full L-BFGS shared-exponent fit lives in the Python CLI.
 
 ## Features (v0.1)
 
@@ -50,11 +81,11 @@ Research tab: CSV upload + synthetic IsoFLOP demo (full L-BFGS shared-exponent f
 | Laws | Classic Chinchilla + optimizer-aware \(\rho_N,\rho_D\) |
 | Allocate | Budget→(N*,D*), fixed N, fixed tok/param, target-loss inverse |
 | IsoFLOP | Loss curves + closed-form star marker |
-| Cost | GPU catalog (H100, A100, L40S, …), MFU, $/day |
+| Cost | GPU catalog (H100 / H100 PCIe, A100 80/40, L40S, …), MFU, $/day |
 | Compare | Multi-optimizer overlay + compute-savings to match AdamW loss |
 | Fit | L-BFGS / grid+refine, Huber, bootstrap CI, shared-exponent vs separate |
 | I/O | CSV/JSON runs, Markdown reports, Python snippets |
-| Web | Dark/light, presets, URL state, export |
+| Web | Dark/light, presets, URL state, export, ρ heatmap |
 
 ## Default ρ priors (planning only)
 

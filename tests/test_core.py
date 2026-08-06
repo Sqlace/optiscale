@@ -229,3 +229,14 @@ def test_cli_allocate_modes_smoke(capsys):
     assert main(["allocate", "--target-loss", "2.8", "--optimizer", "adamw"]) == 0
     out = capsys.readouterr().out
     assert "N" in out
+
+
+def test_moe_active_frac_matches_dense_at_one():
+    dense = allocate_for_budget(1e22, optimizer="muon")
+    moe1 = allocate_for_budget(1e22, optimizer="muon", active_frac=1.0)
+    assert moe1["N"] == pytest.approx(dense["N"], rel=1e-9)
+    assert moe1["D"] == pytest.approx(dense["D"], rel=1e-9)
+    sparse = allocate_for_budget(1e22, optimizer="muon", active_frac=0.25)
+    # Same FLOP budget → more total params when only 25% active
+    assert sparse["N"] > dense["N"]
+    assert sparse["N_active"] == pytest.approx(sparse["N"] * 0.25, rel=1e-9)

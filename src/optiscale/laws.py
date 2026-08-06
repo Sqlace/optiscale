@@ -81,8 +81,15 @@ def list_optimizers() -> list[dict[str, Any]]:
 
 
 def flops(n: float, d: float) -> float:
-    """Approximate training FLOPs C ≈ 6ND."""
+    """Approximate training FLOPs C ≈ 6ND (dense)."""
     return 6.0 * float(n) * float(d)
+
+
+def flops_moe(n_total: float, d: float, active_frac: float) -> float:
+    """MoE / sparse FLOP model: C ≈ 6 · N_active · D with N_active = active_frac · N_total."""
+    if not 0.0 < active_frac <= 1.0:
+        raise ValueError("active_frac must be in (0, 1]")
+    return 6.0 * float(n_total) * float(active_frac) * float(d)
 
 
 def effective_params(

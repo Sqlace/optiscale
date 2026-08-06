@@ -18,6 +18,7 @@ import {
   withRho,
   type OptimizerMeta,
 } from "./engine";
+import { fitSharedExponents } from "./fit";
 
 type State = {
   theme: "dark" | "light";
@@ -543,7 +544,8 @@ function renderResearch() {
       <textarea id="csvIn" rows="8" placeholder="N,D,L,optimizer&#10;1e8,2e9,3.2,adamw&#10;..."></textarea>
       <div class="row" style="margin-top:0.75rem">
         <button class="icon-btn" id="synthBtn">Load synthetic demo</button>
-        <button class="icon-btn" id="fitBtn">Compare fit strategies</button>
+        <button class="icon-btn" id="fitBtn">Run browser L-BFGS fit</button>
+        <button class="icon-btn" id="dlFitBtn" ${fitKeys.length ? "" : "disabled"}>Download fit.json</button>
         <button class="icon-btn" id="applyRhoBtn" ${fitKeys.length ? "" : "disabled"}>Apply ρ to Practitioner</button>
         <select id="applyOptSel" ${fitKeys.length ? "" : "disabled"}>
           ${
@@ -603,34 +605,28 @@ function renderResearch() {
       byOpt[r.optimizer].L.push(r.L);
     }
     lastFitRhos = {};
+    let fitResult;
+    try {
+      fitResult = fitSharedExponents(byOpt);
+    } catch (err) {
+      el("#fitOut").textContent = `Fit failed: ${(err as Error).message}`;
+      return;
+    }
     const summary: string[] = [
-      "Browser fit summary (full L-BFGS lives in Python `optiscale fit`):",
+      `Browser L-BFGS shared-exponent fit (success=${fitResult.success})`,
+      `mean RMSE=${fitResult.mean_rmse.toFixed(4)}`,
+      `params: E=${fitResult.params.E.toFixed(3)} A=${fitResult.params.A.toFixed(1)} B=${fitResult.params.B.toFixed(1)} α=${fitResult.params.alpha.toFixed(3)} β=${fitResult.params.beta.toFixed(3)}`,
       "",
     ];
-    for (const [name, data] of Object.entries(byOpt)) {
-      const o = OPTIMIZERS.find((x) => x.id === name) ?? {
-        id: name,
-        label: name,
-        rho_n: 1,
-        rho_d: 1,
-      };
-      let sse = 0;
-      for (let i = 0; i < data.N.length; i++) {
-        const ne = data.N[i] * o.rho_n;
-        const de = data.D[i] * o.rho_d;
-        const pred = 1.69 + 406.4 / ne ** 0.34 + 410.7 / de ** 0.28;
-        sse += (pred - data.L[i]) ** 2;
-      }
-      const rmse = Math.sqrt(sse / data.N.length);
+    for (const [name, meta] of Object.entries(fitResult.rhos)) {
+      const rmse = fitResult.per_optimizer_rmse[name] ?? NaN;
       summary.push(
-        `${o.label}: n=${data.N.length}  RMSE under prior ρ = ${rmse.toFixed(4)}  (ρN=${o.rho_n}, ρD=${o.rho_d})`,
+        `${meta.label}: ρN=${meta.rho_n.toFixed(3)} ρD=${meta.rho_d.toFixed(3)}  RMSE=${rmse.toFixed(4)}`,
       );
-      lastFitRhos[name] = { rho_n: o.rho_n, rho_d: o.rho_d, label: o.label };
+      lastFitRhos[name] = { rho_n: meta.rho_n, rho_d: meta.rho_d, label: meta.label };
     }
-    summary.push("", "Run for full shared-exponent fit + bootstrap CI:");
-    summary.push("  pip install -e .");
-    summary.push("  optiscale fit --synthetic --bootstrap 200 --out fit.json");
-    summary.push("  optiscale compare --flops 1e24 --fit fit.json");
+    summary.push("", "Download fit.json or Apply ρ to Practitioner.");
+    (window as unknown as { __lastFitJson?: unknown }).__lastFitJson = fitResult;
     el("#fitOut").textContent = summary.join("\n");
     // Refresh apply controls without wiping textarea
     const applyBtn = el<HTMLButtonElement>("#applyRhoBtn");
@@ -643,6 +639,17 @@ function renderResearch() {
           `<option value="${k}">${lastFitRhos[k].label} (ρN=${lastFitRhos[k].rho_n.toFixed(2)})</option>`,
       )
       .join("");
+    const dl = el<HTMLButtonElement>("#dlFitBtn");
+    dl.disabled = false;
+    dl.onclick = () => {
+      const payload = (window as unknown as { __lastFitJson?: unknown }).__lastFitJson;
+      if (!payload) return;
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "fit.json";
+      a.click();
+    };
   };
   el("#applyRhoBtn").onclick = () => {
     const sel = el<HTMLSelectElement>("#applyOptSel").value;

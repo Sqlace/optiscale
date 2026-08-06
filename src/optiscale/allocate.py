@@ -45,15 +45,25 @@ def allocate_for_budget(
     params: ChinchillaParams | None = None,
     rho_n: float | None = None,
     rho_d: float | None = None,
+    active_frac: float | None = None,
 ) -> dict[str, Any]:
-    """Map FLOP budget C → optimal (N*, D*) for an optimizer."""
+    """Map FLOP budget C → optimal (N*, D*) for an optimizer.
+
+    If ``active_frac`` is set (MoE), FLOPs obey C ≈ 6 · (active_frac · N) · D
+    while loss depends on total params N. Equivalent to dense allocate at
+    effective compute C / active_frac.
+    """
     if compute <= 0:
         raise ValueError("compute must be positive")
     params = params or ChinchillaParams()
     rho = _resolve_rho(optimizer, rho_n, rho_d)
-    n, d = _optimal_nd_closed_form(compute, params, rho)
+    frac = 1.0 if active_frac is None else float(active_frac)
+    if not 0.0 < frac <= 1.0:
+        raise ValueError("active_frac must be in (0, 1]")
+    # Dense ridge on effective FLOPs C/frac → N_total*, D*
+    n, d = _optimal_nd_closed_form(compute / frac, params, rho)
     loss = float(chinchilla_loss(n, d, params, rho))
-    return {
+    out = {
         "optimizer": rho.name,
         "label": rho.label or rho.name,
         "rho_n": rho.rho_n,
@@ -67,6 +77,11 @@ def allocate_for_budget(
         "D_human": format_params(d),
         "compute_human": format_flops(compute),
     }
+    if active_frac is not None:
+        out["active_frac"] = frac
+        out["N_active"] = n * frac
+        out["N_active_human"] = format_params(n * frac)
+    return out
 
 
 def _resolve_rho(

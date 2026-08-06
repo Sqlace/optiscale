@@ -67,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--rho-n", type=float, default=None)
     a.add_argument("--rho-d", type=float, default=None)
     a.add_argument("--fit", default=None, help="fit.json from `optiscale fit --out`")
+    a.add_argument(
+        "--active-frac",
+        type=float,
+        default=None,
+        help="MoE active parameter fraction in (0,1]; C≈6·frac·N·D",
+    )
 
     c = sub.add_parser("compare", help="Compare optimizers at a budget")
     c.add_argument("--flops", type=float, default=None)
@@ -78,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", default=None)
     c.add_argument("--md", default=None)
     c.add_argument("--fit", default=None, help="fit.json with fitted ρ overrides")
+    c.add_argument("--active-frac", type=float, default=None, help="MoE active fraction")
 
     f = sub.add_parser("fit", help="Fit laws from CSV/JSON or synthetic demo")
     f.add_argument("--data", default=None, help="Path to CSV/JSON runs")
@@ -165,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.flops is None:
                 print("Provide --flops (or --target-loss / --fixed-n / --ratio)", file=sys.stderr)
                 return 2
+            if args.active_frac is not None:
+                kw["active_frac"] = args.active_frac
             _print(allocate_for_budget(args.flops, **kw))
     elif args.cmd == "compare":
         opts = [x.strip() for x in args.optimizers.split(",") if x.strip()]
@@ -173,6 +182,36 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, "fit", None):
             fit = load_fit_json(args.fit)
             fit_params, fit_rhos = params_from_fit(fit)
+        rows = []
+        compute = args.flops
+        if compute is None:
+            if args.budget_usd is None:
+                print("Provide --flops or --budget-usd", file=sys.stderr)
+                return 2
+            report = cost_report(
+                budget_usd=args.budget_usd,
+                gpu_id=args.gpu,
+                count=args.count,
+                mfu=args.mfu,
+                optimizers=opts,
+                params=fit_params,
+                rho_overrides=fit_rhos,
+            )
+            compute = report["wallclock"]["compute"]
+            rows = report["allocations"]
+        else:
+            for name in opts:
+                kw: dict[str, Any] = {"params": fit_params} if fit_params else {}
+                if fit_rhos and name in fit_rhos:
+                    kw["rho_n"] = fit_rhos[name].rho_n
+                    kw["rho_d"] = fit_rhos[name].rho_d
+                if args.active_frac is not None:
+                    kw["active_frac"] = args.active_frac
+                rows.append(allocate_for_budget(compute, optimizer=name, **kw))
+            base = next((r for r in rows if r["optimizer"] == "adamw"), rows[0])
+            for row in rows:
+                row["N_ratio_vs_ref"] = row["N"] / base["N"]
+                row["delta_N_vs_ref"] = row["N"] - base["N"]
         report_kw: dict[str, Any] = {
             "gpu_id": args.gpu,
             "count": args.count,
@@ -181,17 +220,10 @@ def main(argv: list[str] | None = None) -> int:
             "params": fit_params,
             "rho_overrides": fit_rhos,
         }
-        if args.flops is not None:
-            report = cost_report(compute=args.flops, **report_kw)
-        elif args.budget_usd is not None:
-            report = cost_report(budget_usd=args.budget_usd, **report_kw)
-        else:
-            print("Provide --flops or --budget-usd", file=sys.stderr)
-            return 2
-        rows = report["allocations"]
         if args.csv:
             save_allocation_csv(rows, args.csv)
         if args.md:
+            report = cost_report(compute=compute, **report_kw)
             save_markdown_report(report, args.md)
         _print(rows)
     elif args.cmd == "fit":

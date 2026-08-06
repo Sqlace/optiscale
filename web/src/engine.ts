@@ -112,15 +112,25 @@ export function allocate(
   compute: number,
   opt: OptimizerMeta,
   p: ChinchillaParams = DEFAULT_PARAMS,
-): { N: number; D: number; loss: number; tokensPerParam: number } {
-  // Minimize L=E+A/(ρN N)^α+B/(ρD D)^β s.t. C=6ND
+  activeFrac?: number,
+): { N: number; D: number; loss: number; tokensPerParam: number; N_active?: number } {
+  const frac = activeFrac ?? 1;
+  if (!(frac > 0 && frac <= 1)) throw new Error("activeFrac must be in (0, 1]");
+  // MoE: C ≈ 6·frac·N·D → dense ridge at C/frac
   const a = p.alpha;
   const b = p.beta;
   const gStar = ((p.A * a) / (p.B * b)) ** (1 / (a + b));
   const rhoPref = (opt.rho_d ** b / opt.rho_n ** a) ** (1 / (a + b));
-  const n = gStar * rhoPref * (compute / 6) ** (b / (a + b));
-  const d = compute / (6 * n);
-  return { N: n, D: d, loss: loss(n, d, opt, p), tokensPerParam: d / n };
+  const n = gStar * rhoPref * (compute / frac / 6) ** (b / (a + b));
+  const d = compute / frac / (6 * n);
+  const out: { N: number; D: number; loss: number; tokensPerParam: number; N_active?: number } = {
+    N: n,
+    D: d,
+    loss: loss(n, d, opt, p),
+    tokensPerParam: d / n,
+  };
+  if (activeFrac != null) out.N_active = n * frac;
+  return out;
 }
 
 export function allocateFixedRatio(

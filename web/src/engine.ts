@@ -261,3 +261,107 @@ export function rhoSensitivityGrid(
   }
   return { rhoN, rhoD, deltaN, loss: lossGrid };
 }
+
+/** log-N × log-D loss landscape with isoFLOP ridge marker. */
+export function lossLandscapeGrid(
+  compute: number,
+  opt: OptimizerMeta,
+  steps = 40,
+  span = 16,
+  p: ChinchillaParams = DEFAULT_PARAMS,
+): {
+  N: number[];
+  D: number[];
+  loss: number[][];
+  star: { N: number; D: number; loss: number };
+} {
+  const star = allocate(compute, opt, p);
+  const N: number[] = [];
+  for (let i = 0; i < steps; i++) {
+    const t = i / (steps - 1);
+    N.push((star.N / span) * Math.pow(span * span, t));
+  }
+  const D = N.map((n) => compute / (6 * n));
+  const grid: number[][] = [];
+  for (let j = 0; j < steps; j++) {
+    const row: number[] = [];
+    for (let i = 0; i < steps; i++) {
+      // Evaluate L at (N_i, D_j) unconstrained — classic Chinchilla plane
+      row.push(loss(N[i], D[j], opt, p));
+    }
+    grid.push(row);
+  }
+  return { N, D, loss: grid, star };
+}
+
+/** Rough BF16 param+optimizer-state memory (bytes) for fit check. */
+export function estimateMemoryGb(
+  nParams: number,
+  bytesPerParam = 2,
+  optStateMultiplier = 4,
+  activationFactor = 1.5,
+): number {
+  return (nParams * bytesPerParam * optStateMultiplier * activationFactor) / 1e9;
+}
+
+export function memoryFit(
+  nParams: number,
+  gpu: GPUSpec,
+  count: number,
+): { needGb: number; haveGb: number; fits: boolean; util: number } {
+  const needGb = estimateMemoryGb(nParams);
+  const haveGb = gpu.memoryGb * count;
+  return { needGb, haveGb, fits: needGb <= haveGb * 0.9, util: needGb / haveGb };
+}
+
+/** log-N × log-D loss landscape with isoFLOP ridge marker. */
+export function lossLandscapeGrid(
+  compute: number,
+  opt: OptimizerMeta,
+  steps = 40,
+  span = 16,
+  p: ChinchillaParams = DEFAULT_PARAMS,
+): {
+  N: number[];
+  D: number[];
+  loss: number[][];
+  star: { N: number; D: number; loss: number };
+} {
+  const star = allocate(compute, opt, p);
+  const N: number[] = [];
+  for (let i = 0; i < steps; i++) {
+    const t = i / (steps - 1);
+    N.push((star.N / span) * Math.pow(span * span, t));
+  }
+  const D = N.map((n) => compute / (6 * n));
+  const grid: number[][] = [];
+  for (let j = 0; j < steps; j++) {
+    const row: number[] = [];
+    for (let i = 0; i < steps; i++) {
+      // Evaluate L at (N_i, D_j) unconstrained — classic Chinchilla plane
+      row.push(loss(N[i], D[j], opt, p));
+    }
+    grid.push(row);
+  }
+  return { N, D, loss: grid, star };
+}
+
+/** Rough BF16 param+optimizer-state memory (bytes) for fit check. */
+export function estimateMemoryGb(
+  nParams: number,
+  bytesPerParam = 2,
+  optStateMultiplier = 4,
+  activationFactor = 1.5,
+): number {
+  return (nParams * bytesPerParam * optStateMultiplier * activationFactor) / 1e9;
+}
+
+export function memoryFit(
+  nParams: number,
+  gpu: GPUSpec,
+  count: number,
+): { needGb: number; haveGb: number; fits: boolean; util: number } {
+  const needGb = estimateMemoryGb(nParams);
+  const haveGb = gpu.memoryGb * count;
+  return { needGb, haveGb, fits: needGb <= haveGb * 0.9, util: needGb / haveGb };
+}

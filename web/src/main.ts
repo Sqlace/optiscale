@@ -14,6 +14,8 @@ import {
   getOptimizer,
   isoflopCurve,
   rhoSensitivityGrid,
+  lossLandscapeGrid,
+  memoryFit,
   wallclock,
   withRho,
   type OptimizerMeta,
@@ -178,6 +180,7 @@ function renderPractice() {
     alloc = allocate(state.flops, opt);
   }
   const wall = wallclock(displayFlops, gpu, state.count, state.mfu);
+  const mem = memoryFit(alloc.N, gpu, state.count);
   const rows = compareAtBudget(displayFlops, state.selected);
 
   el("#view").innerHTML = `
@@ -231,9 +234,13 @@ function renderPractice() {
           <div class="card"><div class="k">Pred. loss</div><div class="v">${alloc.loss.toFixed(4)}</div></div>
           <div class="card"><div class="k">Wall-clock</div><div class="v">${wall.days.toFixed(2)} d</div></div>
           <div class="card"><div class="k">Est. $</div><div class="v">$${wall.cost.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div></div>
+          <div class="card"><div class="k">Mem fit</div><div class="v ${mem.fits ? "delta-pos" : "delta-neg"}">${mem.fits ? "OK" : "TIGHT"} · ${mem.needGb.toFixed(0)}/${mem.haveGb.toFixed(0)} GB</div></div>
         </div>
         <h2>IsoFLOP curve</h2>
         <canvas id="isoCanvas" width="900" height="360"></canvas>
+        <h2>N–D loss landscape</h2>
+        <p class="muted">L(N,D) plane; star marks compute-optimal (N*,D*) on the C=6ND ridge.</p>
+        <canvas id="landCanvas" width="480" height="420"></canvas>
         <h2>ρ sensitivity — ΔN* vs AdamW</h2>
         <p class="muted">Heatmap of relative ΔN* = (N*(ρ) − N*_AdamW) / N*_AdamW at the current FLOP budget.</p>
         <canvas id="heatCanvas" width="480" height="420"></canvas>
@@ -385,6 +392,7 @@ print(cost_report(compute=${state.flops.toExponential()}, gpu_id="${state.gpu}",
   };
 
   drawIsoflop(opt, displayFlops);
+  drawLandscape(opt, displayFlops);
   drawRhoHeatmap(displayFlops);
 }
 
@@ -446,6 +454,67 @@ function drawIsoflop(opt: OptimizerMeta, flops = state.flops) {
   ctx.fillText("AdamW", w - pad - 120, pad + 8);
   ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
   ctx.fillText(opt.label, w - pad - 120, pad + 24);
+}
+
+function drawLandscape(opt: OptimizerMeta, flops = state.flops) {
+  const canvas = el<HTMLCanvasElement>("#landCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d")!;
+  const grid = lossLandscapeGrid(flops, opt, 36, 12);
+  const padL = 56;
+  const padB = 48;
+  const padT = 24;
+  const padR = 24;
+  const w = canvas.width;
+  const h = canvas.height;
+  const n = grid.N.length;
+  const cellW = (w - padL - padR) / n;
+  const cellH = (h - padT - padB) / n;
+  ctx.clearRect(0, 0, w, h);
+  let minL = Infinity;
+  let maxL = -Infinity;
+  for (const row of grid.loss) {
+    for (const v of row) {
+      if (v < minL) minL = v;
+      if (v > maxL) maxL = v;
+    }
+  }
+  const span = maxL - minL || 1;
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const t = (grid.loss[j][i] - minL) / span;
+      const r = Math.round(30 + t * 200);
+      const gch = Math.round(180 - t * 120);
+      const b = Math.round(120 + t * 40);
+      ctx.fillStyle = `rgb(${r},${gch},${b})`;
+      ctx.fillRect(padL + i * cellW, padT + j * cellH, Math.ceil(cellW), Math.ceil(cellH));
+    }
+  }
+  // Star at (N*, D*) — find nearest grid indices
+  let iStar = 0;
+  let jStar = 0;
+  let best = Infinity;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const dn = Math.abs(Math.log(grid.N[i]) - Math.log(grid.star.N));
+      const dd = Math.abs(Math.log(grid.D[j]) - Math.log(grid.star.D));
+      if (dn + dd < best) {
+        best = dn + dd;
+        iStar = i;
+        jStar = j;
+      }
+    }
+  }
+  ctx.strokeStyle = "#f3ebe1";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(padL + (iStar + 0.5) * cellW, padT + (jStar + 0.5) * cellH, 6, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = "#9a8f82";
+  ctx.font = "12px IBM Plex Mono";
+  ctx.fillText("log N →", w / 2 - 20, h - 14);
+  ctx.fillText("log D ↓", 8, h / 2);
+  ctx.fillText(`★ ${opt.label}`, padL, 16);
 }
 
 function drawRhoHeatmap(flops = state.flops) {

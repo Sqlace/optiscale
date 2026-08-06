@@ -22,16 +22,30 @@ optiscale fit --synthetic
 optiscale report --flops 1e24 --gpu a100 --count 16
 ```
 
-### Fit → compare recipe
+### Stack loop
 
 ```bash
-# Fit shared-exponent ρ with bootstrap CI, persist for reuse
-optiscale fit --synthetic --bootstrap 200 --out fit.json
-
-# Allocations / cost report honor fitted ρ (not planning priors)
-optiscale compare --flops 1e24 --fit fit.json --md report.md
-optiscale compare --budget-usd 1000000 --gpu h100 --count 64 --fit fit.json
+# 1) Fit ρ from IsoFLOP-ish runs
+optiscale fit --data runs.csv --out fit.json --bootstrap 200
 optiscale allocate --flops 1e24 --optimizer muon --fit fit.json
+
+# 2) Train with SpectOptim (paper Aurora on tall MLPs)
+python - <<'PY'
+from spectoptim import SpectOptim, TelemetryLogger, diagnose
+opt = SpectOptim(model, variant="aurora", update_rank_frac=None)
+log = TelemetryLogger("telemetry.csv", every=10)
+# ... train ...
+print(diagnose(model, opt))
+PY
+
+# 3) Inspect death / rank in OrthoLab Flight Recorder
+#    https://sqlace.github.io/ortholab/?panel=flight
+```
+
+### MoE active fraction
+
+```bash
+optiscale allocate --flops 1e24 --optimizer muon --active-frac 0.25
 ```
 
 ### Allocate modes

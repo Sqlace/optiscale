@@ -5,9 +5,14 @@ on:
     branches: [main, master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,22 +22,29 @@ jobs:
       - run: pytest -q
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-      - run: npm install && npm run build
+          node-version: "22"
+      - run: npm ci || npm install
+        working-directory: web
+      - run: npm run build
         working-directory: web
 
   pages:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Don't fail the whole workflow when GitHub Pages runners are unavailable.
+    continue-on-error: true
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-      - run: npm install && npm run build
+          node-version: "22"
+      - run: npm ci || npm install
+        working-directory: web
+      - run: npm run build
         working-directory: web
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4

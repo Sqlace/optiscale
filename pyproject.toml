@@ -30,7 +30,7 @@ dev = ["pytest>=7.4", "pytest-cov>=4.1"]
 optiscale = "optiscale.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/spectral-training/optiscale"
+Homepage = "https://github.com/Sqlace/optiscale"
 Documentation = "https://spectral-training.github.io/optiscale/"
 
 [tool.setuptools.packages.find]

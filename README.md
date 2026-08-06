@@ -4,7 +4,7 @@
 
 OptiScale is an optimizer-aware LLM scaling lab: allocate compute-optimal \(N^*\) and \(D^*\), cost jobs on real GPUs, compare Muon / NorMuon / SOAP / … against AdamW, and fit shared-exponent \(\rho_N,\rho_D\) models.
 
-> Part of the **Spectral Training Stack** with [SpectOptim](https://github.com/spectral-training/spectoptim) and [OrthoLab](https://github.com/spectral-training/ortholab).
+> Part of the **Spectral Training Stack** with [SpectOptim](https://github.com/Sqlace/spectoptim) and [OrthoLab](https://github.com/Sqlace/ortholab).
 
 ## Why
 
